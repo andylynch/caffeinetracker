@@ -1,0 +1,1258 @@
+# WebSocket API contract — Maintenance Supporter
+
+Authoritative command reference for the setup assistant. All command `type`
+strings are namespaced `maintenance_supporter/…`. They ride Home Assistant's
+core WebSocket API — there is **no custom auth**; authenticate with the standard
+HA handshake and a Long-Lived Access Token.
+
+## Envelope
+
+Every request carries a client-assigned integer `id`.
+- Success → `{"id", "type":"result", "success":true, "result": <payload>}`
+- Error → `{"id", "type":"result", "success":false, "error":{"code","message"}}`
+
+Payloads below are the `result` object.
+
+All 109 WebSocket commands the integration registers are covered here. Their
+authorization tiers are frozen in `tests/test_ws_permission_matrix.py` — that
+test is the inventory of record; this file is its prose companion (and
+`tests/test_docs_counts_in_sync.py` keeps the counts quoted here honest).
+
+## Length caps (silently enforced server-side)
+
+`name ≤200`, free text (`notes`, `feedback`, `reason`) `≤2000`, URL `≤2048`,
+icon `≤100`, meta strings (`area_id`, `manufacturer`, `model`, `serial_number`,
+`responsible_user_id`) `≤200`, `type`/`schedule_type` `≤50`, id `≤64`, date
+`≤20`, `entity_slug ≤64` (regex `[a-z0-9_]+`), `entity_id ≤255`,
+`interval_days` `1..3650`, checklist ≤100 items each `≤500`. Most of these are
+checked by the command schema — an over-long value is REFUSED with an error,
+not shortened; the sanitize layer then trims or drops what a schema lets
+through (e.g. free-form maps).
+
+---
+
+## Authorization
+
+- `@require_write` (admin **or** allowlisted operator): all object/task
+  create/update/delete/duplicate/archive/unarchive, `object/{pause,resume,replace}`,
+  `object/from_template`, `task/move`, `tasks/update_many`, `task/set_adaptive`,
+  `task/assign_user`, `task/history/update`, `task/history/delete`, `task/apply_suggestion`,
+  `task/seasonal_overrides`, `task/set_environmental_entity`, `part/*`,
+  `documents/{add_link,update,delete}`, `group/{create,update,delete}`,
+  `views/{save,delete}`, `problem_sensors/adopt`,
+  `integration_setups/{adopt,wire_resets}`, `battery_fleet/{setup,mark_replaced,set_excluded,set_included,set_track_self_charging,set_due_without_sensor,set_ask_cells,record_replacement}`.
+- `@require_admin` (admin only): `reference_numbers/compact` (2.88), `global/update`, `global/test_notification`,
+  `notify/user_targets`,
+  bulk import **and export** (`export`, `csv/export`, `settings/export`,
+  `json/import`, `csv/import`), vacation writes (`vacation/update`, `vacation/end_now`).
+  **The escalation boundary** — an operator can never enable
+  `operator_write_enabled` or edit `admin_panel_user_ids`.
+- No gate (any authenticated user): all read commands + `task/complete`,
+  `task/quick_complete`, `task/undo` (the caller's OWN last completion only),
+  `task/skip`, `task/reset`, `task/postpone`,
+  `task/snooze`, `task/checklist_progress`, `task/set_phase`,
+  `documents/discard_upload` — the household actions every member may take.
+
+Operator writes require: admin set `operator_write_enabled: true` **and** added
+the user to `admin_panel_user_ids`. Otherwise non-admins are denied.
+
+---
+
+## Objects
+
+An object has **no cost and no icon** field. Stored fields: `id` (server-set),
+`name`, `area_id`, `manufacturer`, `model`, `serial_number`,
+`installation_date`, `warranty_expiry`, `documentation_url`, `notes`,
+`ha_device_id` (bind the object to an EXISTING HA device — its entities then
+land on that device's page; also what makes suggested setups recognise the
+object), `parent_entry_id` (nest under another maintenance object — written to the
+device registry as `via_device_id` after setup),
+`task_ids`, `archived_at?`, `paused_at?`/`paused_until?` (seasonal pause),
+`predecessor_entry_id?`/`replaced_by_entry_id?` (the `object/replace` chain),
+`ref_no` (2.79, #170: the object's reference number — read-only, assigned on
+setup; tasks carry theirs as `ref_no` too, completed history entries as
+well: `8.3-2` = object 8, task 3, completion 2),
+and `parts` (spare parts, see below). The `objects` / `object` responses add
+two computed (never stored) fields: `document_count` and `manual_docs`
+(attached documents tagged "manual" as `{id, title, kind, url?}` — the panel's
+manual-column fallback when `documentation_url` is empty).
+
+### `object/create` — `@require_write`
+```json
+{ "type": "maintenance_supporter/object/create", "id": 1,
+  "name": "Heating pump",              // REQUIRED, 1..200
+  "area_id": "basement",               // optional | null
+  "manufacturer": "Grundfos",          // optional | null
+  "model": "UPS2 25-60",               // optional | null
+  "serial_number": "…",                // optional | null
+  "installation_date": "2021-03-15",   // optional, YYYY-MM-DD, else err invalid_date
+  "warranty_expiry": "2026-03-15",     // optional, YYYY-MM-DD
+  "documentation_url": "https://…",    // optional, http/https only, else invalid_url
+  "notes": "…",                        // optional | null
+  "ha_device_id": "<device_id>",       // optional; bind to an existing HA device
+  "parent_entry_id": "<entry_id>",     // optional; nest under another object
+  "place": "zone.allotment",           // optional | null; an HA zone, null/"zone.home" = home (2026-10)
+  "remind_on_site": true,              // optional; with a place: reminders wait until somebody is there
+  "dry_run": true }                    // optional; true = validate only
+```
+Result: `{"entry_id": "<config_entry_id>"}`. Dry-run: `{"valid": true, "entry_id": null}`.
+Errors: `invalid_input` (empty name; a name another object already has, also on a
+dry run: translation key `object_name_taken`), `invalid_date`, `invalid_url`, `create_failed`,
+`invalid_device` (unknown `ha_device_id`), `self_link_device` (the device belongs
+to Maintenance Supporter itself — the object's own twin or a sibling object's
+device; pick the appliance integration's device, for hierarchy use
+`parent_entry_id`).
+
+**Uniqueness:** the name is slugified (lowercase, non-alphanumeric → `_`) into a
+`unique_id`; a duplicate (case-insensitive) name aborts as `create_failed`.
+Read `maintenance_supporter/objects` first to avoid collisions.
+
+### `object/update` — `@require_write`
+`{entry_id (req), + any create field}`. Partial: only present keys change.
+Result: `{"success": true}`. Same field errors as create, incl.
+`invalid_device` / `self_link_device` for `ha_device_id`. Changing
+`ha_device_id` to another device (2.96) moves the tasks' wiring to it — trigger
+entities, completion-action targets and `origin.device_id` go to the matching
+entities of the new device — and the result adds `device_swap: {moved,
+unmatched: [entity ids left as they were]}`; check the unmatched tasks.
+Places (2026-10): `place` is a zone entity id (anything else, `""` and
+`zone.home` store home); `remind_on_site` only sticks next to a place. The
+`objects` / `object` payload adds `place`, `place_name`, `place_missing`
+(set but the zone is gone; the object then behaves as at home) and
+`remind_on_site`.
+
+### `object/delete` — `@require_write`
+`{entry_id}`. Result `{"success": true}`.
+
+### `object/archive` / `object/unarchive` — `@require_write`
+`{entry_id}`. Archive cascades `archived_reason:"object"` onto active tasks;
+result `{"success": true, "archived_at": "<iso>"}`. Unarchive `{entry_id, undo?}`
+restores those tasks (recurring ones re-anchored to a fresh cycle; with
+`undo: true`, the Undo of an archive just made, they keep their dates).
+Errors: `already_archived` / `not_archived`.
+
+### Meter readings (v2.20, #83)
+`reading`-type tasks accept `reading_unit` (str ≤32, e.g. "kWh") on
+`task/create`/`task/update`, and `task/complete` accepts `reading_value`
+(float) which is stored on the completion history entry. The panel derives
+the delta between consecutive readings client-side.
+
+**Reading slots (2.75, #161 phase 2):** `task/create`/`task/update` take
+`readings: [{id?, name, unit?}]` (≤20; a missing/invalid id is minted, `[]`
+clears) and the task response echoes `readings` with the stable ids.
+`task/complete` then takes `reading_values: {slot_id: float|null}` — the
+entry stores the snapshot `reading_values: [{id, name, unit, value}]`
+(a slot without a unit snapshots the task's `reading_unit`); an unknown id
+is refused with `invalid_input`, `null` means "meter not read this time".
+"Never both": on a task with slots the scalar `reading_value` is refused
+(`reading_slots_required` — WS, service and history edit alike), and a
+slot patch on a scalar-era entry drops the scalar. Slot names are unique
+per task (case-insensitive; duplicates are dropped by the sanitizer).
+`task/history/delete` `{entry_id, task_id, timestamp}` (2.84, #170) removes one
+entry (the first with that timestamp); last_performed is re-derived from the remaining lifecycle entries (none
+left → the task reads as never performed), photos stay in the documents, and
+the entry's `used_parts` go back to stock (answer: `parts_returned`). The
+delete and `task/history/update` move last_performed only when they change
+which lifecycle entry is the latest (2.104): a reset entry counts on its
+`reset_date` (the day it restarted the cycle; older entries name it in their
+`Reset to YYYY-MM-DD` note), and a last_performed set through `task/update`
+that is newer than the history stays.
+
+`task/undo` `{entry_id, task_id}` (2026-10) takes back the caller's own last
+completion (`task/complete` / `task/quick_complete` answer `undo: true` when
+they remembered it): history, cycle anchor, phase, learning and parts stock are
+restored. One level per person, ten minutes; errors `nothing_to_undo` (another
+task, expired, nothing remembered) and `changed_since` (the task changed
+meanwhile). Answer `action_ran: true` when the task has a completion action —
+that one already ran and stays.
+
+`task/history/update` `{entry_id, task_id, original_timestamp (req — the
+entry's timestamp exactly as stored; it identifies the entry), ...patch}`
+patches `reading_value` (scalar, `null` clears) and
+`reading_values` (the same map — REPLACES the snapshot; ids may also be
+slots the task no longer has, taken from the entry's own snapshot). The
+`complete` **service** takes `reading_values` keyed by slot NAME
+(case-insensitive). The task sensor exposes `last_readings` /
+`last_reading` + `last_reading_at`; the completion event carries
+`reading_value` and `reading_values`.
+
+### Backdated completions (#133)
+`task/complete` accepts `completed_at` (ISO datetime, naive = local; must not
+be in the future). When it is still the latest lifecycle entry the cycle
+advances normally anchored on that moment; when OLDER than the latest one it
+is a pure backfill — history entry (+ cost/parts) only, the cycle anchor,
+trigger latch and rotation stay put. Bypasses the double-tap dedup guard and
+(for past days) the earliest-completion window. The
+`maintenance_supporter_task_completed` event carries the entry's timestamp as
+`completed_at` plus `backfill: bool`; pure backfills skip
+`on_complete_action`. Same parameter on the `maintenance_supporter.complete`
+service.
+
+### `object/pause` / `object/resume` — `@require_write` (v2.20)
+Seasonal pause. Pause: `{entry_id, until?}` (`until` = ISO date, must be in the
+future; omit for an open-ended pause) → `{"success": true, "paused_at",
+"paused_until"}`. Tasks read status `paused` (frozen, nothing fires); the
+coordinator auto-resumes on `until`. Resume: `{entry_id, undo?}` → `{"success": true}`;
+recurring tasks re-anchor to a fresh cycle from today (`undo: true`, the Undo of
+a pause just made, keeps their dates). Errors: `archived` /
+`already_paused` / `not_paused` / `invalid_date`.
+
+### `task/pause` / `task/resume` — `@require_write` (2.96, #193)
+The object pause for ONE task. Pause: `{entry_id, task_id, until?}` → `{"success":
+true, "paused_at", "paused_until"}`; the task reads status `paused` (frozen,
+nothing fires), the object's other tasks keep running, the coordinator
+auto-resumes on `until`. Resume: `{entry_id, task_id, undo?}` → `{"success": true}`; a
+recurring task restarts a fresh cycle from today (`undo: true` keeps its dates).
+An object resume leaves a
+task paused on its own paused. Task payloads carry `paused`, `paused_at`,
+`paused_until`. Errors: `archived` / `already_paused` / `not_paused` /
+`invalid_date`.
+
+### `object/replace` — `@require_write` (v2.20)
+`{entry_id, name?, ha_device_id?}` → `{entry_id: "<successor>", device_swap?}`.
+Retires the old object (archive cascade + `replaced_by_entry_id`) and creates a
+successor pre-filled from it: task configs with fresh ids/counters, documents
+carried over (refcounted), `installation_date` = today, serial/warranty
+cleared, `predecessor_entry_id` set. `ha_device_id` (2.96): omitted = the
+successor keeps the old device (a controller that stays); a device id = the new
+unit's device, and the wiring moves as in `object/update` (`device_swap` in the
+result); `null` = no device. Ask the user — a new machine is usually a new
+device. Errors: `archived` (already retired), `invalid_device`.
+
+### Spare parts (2.23) — `part/*` — `@require_write`
+`part/create` `{entry_id, name (req), vendor?, mpn?, gtin?  (EAN/UPC digits,
+GS1 check-digit validated), storage_location?, product_url?, unit?, cost?,
+stock? (number ≤100000, two decimals — omit for a catalog-only part),
+reorder_threshold?, restock_quantity?, package_size?, auto_buy_task?, notes?,
+reuse?, restoring?}` → `{part_id}`. `reuse` (#208) marks a part that is not used
+up: one of `charge` · `sharpen` · `clean` · `dry` · `refill` · `restore` (null =
+used up). A use then moves the used ones from `stock` to `restoring` (waiting to
+be ready again), and they still count as owned for `reorder_threshold`, buying
+and the low/out events; `restoring` sets that count (a correction, or a worn-out
+one thrown away). `package_size` (2.96, #98) = units per bought package (a 400 ml
+can: `400`, unit `ml`): `stock`, `reorder_threshold` and task quantities count
+units, `restock_quantity` and `cost` count packages; unset = one package is one
+unit.
+`part/update` `{entry_id, part_id, name (req), ...same fields}` (`name` is
+required on every update; other omitted fields keep their stored values;
+`stock: null` untracks). `part/delete` `{entry_id, part_id}`
+(also prunes task links + any open buy reminder). `part/restock`
+`{entry_id, part_id, delta | absolute}` → `{stock}`. `part/ready_again` (#208)
+`{entry_id, part_id, quantity?}` → `{moved, stock, restoring}` — used ones of a
+reusable part are ready again (charged, sharpened, ...): back from `restoring`
+to `stock`, all of them without `quantity`; `not_found` for a part that is not
+reusable or has no tracked stock. `part/dispose` (#218) `{entry_id, part_id,
+quantity?}` → `{disposed, stock, restoring}` — used ones that cannot be made
+ready again (a dead cell): off `restoring` without going back to `stock`, one
+without `quantity`, capped at the waiting ones; same `not_found`.
+`parts/overview` (#130, read tier, no args) → `{parts: [...], count}` — the
+instance-wide inventory: every part with its stored fields plus `part_id`,
+`entry_id` + `object_name` (owner), live `stock`, `restoring`, `low`, and `consumers:
+[{entry_id, object_name, task_id, task_name, quantity, pooled}]` covering the
+owner's own task links AND pooled #111 links from other objects.
+Link consumption on the task: `task/create|update` accept
+`consumes_parts: [{part_id, quantity, entry_id?}]`. **`entry_id` (2.44+, #111)
+names another object that owns the pool** — several appliances sharing one box
+of filters; omit it for a part of the task's own object. Both write paths
+validate the reference and drop a link whose object or part does not exist, and
+`task/complete`'s `used_parts` takes the same shape. Deleting an object that
+owns a shared pool moves the part and its stock to the longest-standing
+borrower and repoints the other links. Parts ride the `objects` payload
+(each with merged `stock`, `is_low`, `shopping_url`). While a part with
+`auto_buy_task` is at/below its threshold, a one-off "Buy {part}" task exists
+(marker `part_ref`); completing it restocks (`task/complete` accepts
+`restock_quantity`, in packages).
+
+**Parts cost (2.96, #104).** Every completion entry records `used_parts[].
+unit_cost` (the price of one unit at that moment), `parts_cost` (their value),
+`purchase: true` on a buy task, and `cost_basis: "use"` when the setting
+`parts_cost_mode` was `use`. An entry's spending is its `cost`, except with
+`cost_basis: "use"`: then a purchase counts 0 and `parts_cost` is added — the
+budget, `total_cost` and `statistics` follow that rule.
+
+**Credits (#200).** A `cost` below zero is money that came back — the old
+unit sold, a refund. Every writer takes it down to -1e6 (`task/complete`,
+`task/history/update`, `quick_complete_defaults`, the `complete` service,
+imports); every total nets it (`total_cost`, the budget and its alerts,
+the area cost sensors). A task's `average_cost` is the mean cost per
+completion with the credits left out (`null` without one). With `use`, a buy task's
+`cost` sets the part's `cost` (per package) instead.
+
+### `templates` — read — **the shipped object catalog**
+`{language?}` (BCP-47-ish, ≤10 chars; defaults to the server language) →
+```json
+{ "categories": {"<cat_id>": {…}},
+  "profile": { "dwelling": "house", "dwelling_detected": "house",
+               "dwelling_reasons": ["floors", "area_garden"], "dwelling_source": "auto",
+               "country": "DE", "hemisphere": "north",
+               "climate": {"koppen": "Cfb", "coldest_c": 0, "warmest_c": 19,
+                           "hemisphere": "north", "has_winter": true,
+                           "traits": ["freeze", "snow"]},
+               "traits": ["freeze", "radon", "snow"], "features": ["garden"] },
+  "templates": [ { "id": "appliance_espresso", "name": "Espresso Machine",
+                   "category": "appliance", "disabled": false,
+                   "recommended": false, "reasons": [], "dwelling_mismatch": false,
+                   "tasks": [ {"name":"Descaling","type":"cleaning",
+                               "schedule_type":"time_based",
+                               "interval_days":90,"warning_days":7} ] } ] }
+```
+**Call this before hand-building anything.** The integration ships 96 object templates,
+curated (heating, heat pump, frost protection, garden,
+vehicle, health, …), each with its tasks, types and interval defaults already
+chosen and localized. It is the only way to enumerate the `template_id` values
+`object/from_template` consumes. `disabled: true` = the admin hid it from the
+pickers in Settings — don't propose those. Everything a template creates stays
+fully editable afterwards, so "template + edits" beats a hand-built object
+nearly every time.
+
+**Home profile (2.93):** `profile` is derived locally — `dwelling` (house /
+apartment / unknown, the `home_type` setting wins over the guess from floors,
+area names and a few devices), `country`, and the climate of the home location
+with `traits` (`freeze`, `snow`, `severe_winter`, `hot_summer`, `hot_humid`,
+`hot_dry`, `damp`, `mediterranean`, `termites`, `wildfire`, `cyclone`,
+`tropical`, `radon`, `earthquake`). Per template,
+`recommended` + `reasons` (`starter` = basics for the dwelling,
+`feature_garage` / `feature_basement` / `feature_garden` = equipment the
+detection saw in the home, `feature_ups` = a UPS behind NUT or apcupsd, a
+trait code, or `country`) say what to suggest first; `dwelling_mismatch` marks templates
+the dwelling rarely has (a pool in an apartment) — suggest those only on
+request. Seasonal template tasks are created with a seasonal window or a fixed
+date, mirrored south of the equator (`profile.hemisphere`). `tasks` lists
+what creating the template in THIS home makes: winter-only tasks (closing a
+pool, winterizing) are left out where there is no winter, and
+`interval_days` is the country's cycle (the UK MOT is yearly). Task notes may
+name legal duties (DIN norms, French boiler rules …) — present them as
+guidance researched in September 2026, never as legal advice: rules vary by
+region and change, and local regulations take precedence.
+
+### `object/from_template` — `@require_write`
+`{template_id (req), name?, language?}` → `{entry_id}`. Creates the object **and
+all of the template's tasks** in one call; `language` (the user's UI language)
+localizes the created object and task names, else the server language. `object/duplicate` `{entry_id}` → `{entry_id}`.
+
+---
+
+## Tasks
+
+### `task/create` — `@require_write`
+```json
+{ "type": "maintenance_supporter/task/create", "id": 2,
+  "entry_id": "<object entry_id>",     // REQUIRED
+  "name": "Replace filter",            // REQUIRED, 1..200
+  "task_type": "replacement",          // wire key; stored as "type". default "custom".
+                                       //   enum: cleaning|inspection|replacement|calibration|service|reading|custom
+  "schedule_type": "time_based",       // default. time_based|sensor_based|manual|one_time
+  "interval_days": 90,                 // 1..3650 | null (time interval)
+  "interval_unit": "days",             // days|weeks|months|years (default days)
+  "interval_anchor": "completion",     // completion|planned
+  "due_date": "2026-08-01",            // for one_time
+  "schedule": { … },                   // nested recurrence instead of the flat keys — calendar kinds, see "Time / calendar recurrence"
+  "warning_days": 7,                   // 0..365; omitted = the default_warning_days setting (lead time before due)
+  "earliest_completion_days": 14,      // 0..3650 | null: completing is refused (too_early) until this many days before due
+  "last_performed": "2026-05-01",      // YYYY-MM-DD | null; seeds a completed history entry
+  "trigger_config": { … },             // sensor trigger, see below | null
+  "notes": "…",                        // ≤2000
+  "documentation_url": "https://…",    // http/https
+  "responsible_user_id": "<ha_user_id>",
+  "assignee_pool": ["<user_id>", "…"], // ≤25 HA user ids; with rotation_strategy the duty rotates on each completion
+  "rotation_strategy": "round_robin",  // round_robin|least_completed|random | null (needs ≥2 in the pool)
+  "required_completion_fields": ["notes"], // subset of notes|cost|duration|photo|user — no-prompt surfaces (buttons, NFC, voice) then refuse
+  "priority": "normal",                // low|normal|high (named first within the same due day; filterable)
+  "labels": ["garden"],                // ≤25 × ≤40 chars, free tags (filters, notification scope)
+  "entity_slug": "filter_replace",     // [a-z0-9_]+, ≤64, else invalid_entity_slug
+  "custom_icon": "mdi:air-filter",     // per-task icon
+  "nfc_tag_id": "…",                   // duplicate = warning, not error
+  "require_tag_scan": false,           // 2.67 proof of presence: only an NFC/QR scan may complete
+  "allow_skip": true,                  // #150: false = skip lock (server refuses task/skip + voice SkipTask)
+  "notify_enabled": true,              // #173: false = no reminders for this task (status, repeats, lead-time, bundles); stored only when false
+  "notify_icon": "mdi:air-filter",     // #185: push-notification icon override (mdi:…, ≤64); null/"" = the maintenance type's default; malformed = invalid_icon
+  "checklist": ["Turn off power", "…"],// ≤100 items, each ≤500
+  "reading_unit": "kWh",               // reading tasks — see "Meter readings" (also `readings` slots)
+  "consumes_parts": [{"part_id": "p1", "quantity": 1}], // see "Spare parts"
+  "mirror_todo_entities": ["todo.household"], // ≤5 todo.* lists the task is mirrored into while due (D#183)
+  "on_complete_action": {"service": "counter.reset", "target": {"entity_id": "counter.x"}, "data": {}},
+                                       // HA service called after each (non-backfill) completion; a privileged domain drops the action on save
+  "quick_complete_defaults": {"notes": "…", "cost": 0}, // what task/quick_complete (and the quick-complete QR) records
+  "phases": {                          // #139 cycle phases (≤10 defs) | null clears
+    "flip":    { "name": "Flip blades" },            // per-phase overrides (optional):
+    "replace": { "name": "Replace blades",           //   checklist, consumes_parts,
+                 "consumes_parts": [{"part_id": "p1", "quantity": 9}] } //   required_completion_fields
+  },
+  "phase_sequence": ["flip","flip","replace"],  // ≤12 steps, ids from phases; repeats OK
+  "schedule_time": "08:00",            // strict HH:MM — IGNORED while the advanced_schedule_time_visible setting is off
+  "enabled": true,
+  "dry_run": true }
+```
+`on_complete_action` / `quick_complete_defaults` shapes and the refused
+domains: docs/CONFIGURATION.md. Several of these fields are hidden in the
+panel's task dialog until the matching *Advanced Features* switch is on
+(`advanced_*_visible`, see Settings below) — they work regardless, except
+`schedule_time`, which the coordinator strips while its switch is off.
+
+Result: `{"task_id": "<uuid>"}` (+ `"warnings"` maybe). Dry-run:
+`{"valid": true, "task_id": null}`. Errors: `invalid_input`,
+`invalid_trigger_config`, `invalid_url`, `invalid_entity_slug`, `invalid_format`.
+Without a nested `schedule`, `invalid_input` also refuses a flat recurrence that
+contradicts itself (2.104): an unknown `schedule_type`, `one_time` without a
+`due_date` (on `task/update`: unless the task already has one), and `manual` with
+an `interval_days`. A task cannot be added to an archived object.
+
+`invalid_trigger_config` also covers the VALUES (2.68.1+): thresholds,
+`trigger_target_value` and `trigger_baseline_value` must be finite numbers,
+`trigger_for_minutes` a whole number 0–1440, `trigger_target_changes` 1–10000,
+`trigger_runtime_hours` > 0 and ≤ 100000, `trigger_days_before` a whole number 0–365,
+`trigger_delta_mode` a real boolean
+(and a delta counter needs a positive step). Numeric strings are accepted and
+stored as numbers; an explicit `null` on an optional field means "unset". The
+error message names the field and the offending value; in a compound trigger
+it is prefixed with `Condition <index>:`.
+
+> **Time interval vs sensor trigger are orthogonal.** A calendar task uses
+> `interval_days`/`interval_unit`. A sensor task uses `trigger_config`. A task
+> may carry **both** (a sensor trigger plus a safety calendar interval).
+> Time/calendar recurrence is **never** expressed inside `trigger_config`.
+
+> **Phases (#139)** share the task's ONE cadence: each completion performs the
+> step the cursor points at and advances it (wrapping). A phase field that is
+> SET **overrides** the task-level field for that step; unset falls through
+> (override, never merge). Read model: every task echoes `phases`,
+> `phase_sequence`, `phase_cursor` and a resolved
+> `current_phase {id,name,index,count}` (null when phase-less). History entries
+> record the completed step as `phase_id`. Correct the cursor via
+> `task/set_phase`.
+
+### `task/update` / `task/delete` / `task/duplicate` / `task/move` / `task/archive` / `task/unarchive` — `@require_write`
+`update`: `{entry_id, task_id, + any task field}` (partial). `delete`:
+`{entry_id, task_id}`. Recurrence edit: an explicit nested `schedule` wins; a
+flat interval edit rebuilds from flat and drops the nested schedule. A month
+restriction (`months` on `nth_weekday` / `day_of_month`, the yearly template
+tasks) is kept when the sent schedule of the same kind leaves `months` out;
+`months: []` clears it. `unarchive` takes `undo?` like `task/resume`: `true`
+keeps a recurring task's dates instead of starting a fresh cycle; a task of an
+archived object is refused (`archived`, 2.104) — unarchive the object instead.
+`last_performed` is stored as `YYYY-MM-DD` whatever ISO form was sent.
+`move` (2.82): `{entry_id, task_id, target_entry_id}` → `{task_id, entry_id}` — the task
+keeps its id, config, history, readings, adaptive config, trigger runtime and
+group memberships; it gets a new reference number under the target object and
+its entities are recreated there (source and target entries reload). Document
+links stay with the source object. Errors: `not_found`, `invalid_target`
+(same object / archived target), `limit_reached`.
+
+### `tasks/update_many` — `@require_write` (D#199)
+Several tasks changed at once, across objects:
+`{items: [{entry_id, task_id, changes?}] (1..500), changes?}` →
+`{updated: [{entry_id, task_id}], failed: [{entry_id, task_id, code}], previous: [{entry_id, task_id, changes}]}`.
+`changes` (shared, or per item — an item's own map wins) takes
+`responsible_user_id`, `assignee_pool`, `rotation_strategy`, `labels`,
+`priority`, `warning_days`, `notify_enabled` with the same rules as
+`task/update` (`null` clears a field; rotation `off` / reminders on are
+stored as their absence), plus `labels_add` / `labels_remove` to edit
+labels without replacing them. One write and one reload per object. A
+task that cannot take the change is reported in `failed`
+(`not_found`, `invalid_user`, `invalid_input` = no change at all) while
+the others are saved.
+`previous` holds the values each change replaced — send it back as the
+items (without a shared `changes`) to undo.
+
+### Task actions (no write gate)
+- `task/complete` `{entry_id, task_id, notes?, cost? (-1e6..1e6; below zero = a credit), duration? (min, 0..525600), checklist_state? {str:bool}, feedback? (needed|not_needed|not_sure), photo_doc_ids? [doc id, max 10]}` → `{"success": true}` — photos are documents uploaded beforehand via `POST /api/maintenance_supporter/document/upload` (multipart `entry_id`, `tags=photo`, `file`); the history entry stores them as `photo_doc_ids` (entries written before 2.75 carry a single `photo_doc_id`, still accepted on input) — refused with `tag_scan_required` when the task has `require_tag_scan` (only the NFC handler, `task/quick_complete` and the `complete` service with `via_tag_scan: true` pass). Also takes `completed_at` (see *Backdated completions*), `reading_value` / `reading_values` (*Meter readings*), `used_parts` (*Spare parts*) and `restock_quantity` (a buy task). `via_tag_scan: true` exists here too — it is the panel's QR deep-link fallback and ASSERTS that someone scanned the tag at the thing: an assistant must never send it. Other refusals: `too_early` (completion window), `completion_details_required` (required fields), `task_inactive` (archived / disabled / paused)
+- `task/quick_complete` `{entry_id, task_id}` → `{"success": true, "via": "quick"}` (needs stored `quick_complete_defaults`, else `no_defaults`)
+- `task/checklist_progress` `{entry_id, task_id, checklist_state (req, {item text: bool})}` →
+  `{"success": true, "checklist_state": {...}}` — persists in-cycle ticks WITHOUT
+  completing (#73). The dict REPLACES the stored progress; unknown items are
+  dropped; completing or skipping clears it. Echoed on every task as
+  `checklist_progress`.
+- `task/skip` `{entry_id, task_id, reason?, as_missed?}` — `as_missed: true` records the cycle as *missed* rather than skipped (an already overdue task is recorded as missed either way); refused with `skip_disabled` when the task sets `allow_skip: false`
+- `task/reset` `{entry_id, task_id, date?}` (ISO)
+- `task/set_phase` `{entry_id, task_id, cursor (req, int ≥0)}` → `{"success": true}` (read the new cursor from the task) —
+  re-points a phased task's cycle cursor (#139: mis-click repair, mid-cycle
+  adoption). Cursor indexes `phase_sequence`; out of range → `invalid_cursor`,
+  task without phases → `no_phases`. Completions advance the cursor themselves —
+  this is only for corrections.
+- `task/postpone` `{entry_id, task_id, until (req, YYYY-MM-DD)}` → `{"success": true}` —
+  defers **this occurrence only** to a chosen date; the recurrence itself is untouched.
+  Bad date, or one more than 3650 days out → `invalid_date` (the latter with
+  translation key `postpone_too_far`; since 2.96 the limit holds on every
+  surface, voice included). A date in the past (`postpone_in_past`) and a done
+  one-time task (`postpone_done`) are refused (2.104).
+- `task/snooze` `{entry_id, task_id}` → `{"success": true, "hours", "snoozed_until"}` (the duration and the ISO end, 2.96) — silences due-soon /
+  overdue / triggered reminders for the configured `snooze_duration_hours`.
+  Changes neither schedule nor status; the snooze is stored and survives a
+  restart. Without a configured notifier → `unavailable`.
+- `task/assign_user` `{entry_id, task_id, user_id|null}` — `@require_write`; `null` unassigns; unknown user → `invalid_user`. On a rotation the assignee stays in its pool, as with `task/update`: `null` or a user outside the pool assigns the pool's first; the reply's `user_id` is who is assigned now
+
+### `task/list` — read
+`{entry_id?}` → `{tasks:[…]}`. Every task across all objects (or one object's),
+each summary carrying `task_id`, `entry_id`, `object_name` plus the computed
+status fields. The flat counterpart to `objects` when you only care about tasks.
+
+> **History is truncated in LIST payloads (2.52+, perf).** Task summaries in
+> `objects` and `task/list` carry only the **most recent 20** history entries
+> plus `history_count` (the true total) — at 150+ tasks full histories
+> dominated the payload (906 KB measured at 40 entries/task; the store caps
+> at 500). Need the complete record? `task/history`.
+
+### `task/history` — read
+`{entry_id (req), task_id (req)}` → `{history:[…], count}` — the FULL history
+of one task, oldest first, exactly as stored. Error: `not_found`.
+
+### `tasks/by_user` — read (self) / write (others)
+`{user_id (req)}` → `{tasks:[…]}` — the tasks meant for that user (theirs, and
+the ones shared with them that nobody is responsible for), with
+`object_name`+`entry_id` on each. A plain user may query **their own** id only;
+another user's assignments need write permission, else `unauthorized`.
+
+### Adaptive scheduling & analysis
+- `task/analyze_interval` — read — `{entry_id, task_id}` →
+  `{current_interval, average_actual_interval, interval_std_dev, ewa_prediction,
+  weibull_prediction, weibull_beta, weibull_eta, weibull_r_squared,
+  recommended_interval, confidence, confidence_interval_low/high, feedback_count,
+  data_points, recommendation_reason, seasonal_factor, seasonal_factors,
+  seasonal_reason}`. Pure analysis of the completion history — nothing is written.
+  Unknown task → `not_found`.
+- `task/apply_suggestion` — `@require_write` — `{entry_id, task_id, interval
+  (1..3650)}` → `{"success": true}`. Writes an analysed interval onto the task;
+  a task whose schedule is not a day interval (a calendar kind) → `invalid_input`.
+- `task/seasonal_overrides` — `@require_write` — `{entry_id, task_id, overrides:
+  {"<month 1..12>": factor 0.1..5.0}}` (≤12 keys; `{}` clears them) →
+  `{"success": true, "overrides": {…}}`. Manual per-month interval multipliers.
+- `task/set_adaptive` — `@require_write` — `{entry_id, task_id, enabled,
+  ewa_alpha? 0.1..0.9, min_interval_days? 1..365, max_interval_days?,
+  seasonal_enabled?, sensor_prediction_enabled?}` → `{"success": true,
+  adaptive_config}`. Adaptive-scheduling tuning (parity with the options
+  flow's adaptive step); omitted optionals keep stored values, min > max is
+  rejected. The environmental binding stays on its own endpoint below.
+- `task/history/update` also patches `used_parts: [{part_id, quantity,
+  entry_id?}] | null` (#130) — stock is reconciled by the per-part DELTA
+  against the entry's stored consumption; `null`/`[]` clears it and returns
+  the quantities — and `photo_doc_ids: [doc id] | null` (#161): the full
+  list replaces the entry's photos (a legacy `photo_doc_id` scalar is
+  folded in), newly listed ids are linked to the task, a removed id only
+  detaches the photo (the document stays with the object).
+- `task/set_environmental_entity` — `@require_write` — `{entry_id, task_id,
+  environmental_entity?, environmental_attribute?}` → `{"success": true,
+  environmental_entity, environmental_attribute}`. Correlates an outside signal
+  (outdoor temperature…) with the interval; `environmental_entity: null` clears
+  the binding (and drops the attribute with it).
+
+---
+
+## trigger_config (sensor triggers only)
+
+Free-form dict, whitelisted + validated server-side. Types:
+`threshold` (default), `counter`, `state_change`, `runtime`, `compound`.
+Any key outside the whitelist is stripped.
+
+**Common keys** (all non-compound types):
+- `entity_ids`: `list[str]` — canonical, ≥1 entity required. (`entity_id` single
+  is legacy; auto-filled from `entity_ids[0]`.) Non-existent entity → warning.
+- `entity_logic`: `"any"` | `"all"` (multi-entity aggregation; default `any`)
+- `attribute`: `str|null` — monitor an attribute instead of the state value
+- `auto_complete_on_recovery`: `bool` — auto-record completion when trigger clears
+- `trigger_combinator`: `"any"` (default) | `"all"` — how the trigger pairs with
+  the task's safety interval. `any` = whichever is met first makes the task due;
+  `all` = the task only becomes due once the trigger fired AND the interval
+  elapsed (interval acts as a minimum age). Omit for `any`.
+
+### `threshold`
+`{"type":"threshold","entity_ids":["sensor.pressure"],"trigger_above":3.0,"trigger_below":1.2,"trigger_for_minutes":0}`
+At least one of `trigger_above`/`trigger_below`/`trigger_equals`/
+`trigger_not_equals` required. Above/below fire when the value crosses;
+`trigger_equals`/`trigger_not_equals` fire while the value matches / differs
+from a discrete level (filter stages, error codes).
+`trigger_for_minutes` requires the condition to hold that long.
+
+### `counter`
+`{"type":"counter","entity_ids":["sensor.odometer"],"trigger_target_value":15000,"trigger_delta_mode":true}`
+`trigger_target_value` **required**. `trigger_delta_mode:false` (absolute) →
+fires at `value ≥ target`. `true` (delta) → fires when `value − baseline ≥
+target`; baseline captured at setup (best for odometers / ever-increasing meters).
+
+### `state_change`
+`{"type":"state_change","entity_ids":["sensor.dishwasher"],"trigger_from_state":"running","trigger_to_state":"clean","trigger_target_changes":30}`
+Fires after `trigger_target_changes` matching transitions (default 1). Null/empty
+`from`/`to` match any state (lowercased on save). `trigger_for_minutes` (#136,
+default 0) makes a transition count only once the new state has HELD that long
+— the flicker filter for flappy problem sensors and phantom appliance cycles;
+0 counts immediately (some sensors pulse only briefly). The hold window
+survives restarts; an unavailability blip restarts it.
+
+### `runtime`
+`{"type":"runtime","entity_ids":["switch.pump"],"trigger_runtime_hours":500,"trigger_on_states":["on"]}`
+Optional `trigger_runtime_max_session_seconds` (whole, 1..86400): a single ON-session books at most this many seconds (#149 — protects against sensors stuck ON).
+`trigger_runtime_hours` **required**. Accumulates "on" time; default on-states
+`{"on","1","true"}`. `trigger_on_states`, if given, must be a non-empty list.
+
+### `due_date` (2.96)
+`{"type":"due_date","entity_ids":["sensor.shelfy_filter_change_due"],"trigger_days_before":7,"auto_complete_on_recovery":true}`
+For an entity that REPORTS the due date (timestamp or date state, or an
+`attribute` holding one). `trigger_days_before` whole 0..365, default 0 = on
+the date. Fires by timer when the date comes within the lead time; clears when
+the device reports a later date (its own "done" button — make that the
+`on_complete_action`).
+
+### `compound`
+`{"type":"compound","compound_logic":"OR","conditions":[ {…}, {…} ]}`
+`compound_logic`: `"AND"`|`"OR"` (default AND). `conditions`: ≥2 non-compound
+trigger dicts (threshold/counter/state_change/runtime/due_date), each validated
+recursively and may carry its own `entity_ids`+`entity_logic`. **No nested
+compound.** Two-level aggregation: within a condition (`entity_logic`), across
+conditions (`compound_logic`). UI caps at 5 conditions.
+
+---
+
+## Time / calendar recurrence (NOT trigger_config)
+
+Send flat fields (`interval_days` + `interval_unit` + `interval_anchor`, or
+`due_date` for one-time). On persist they normalize into a canonical nested
+`schedule` and the flat keys are dropped — reads echo BOTH forms back. Advanced
+calendar kinds (only expressible via the nested `schedule` object):
+- `{"kind":"interval","every":N,"unit":"days|weeks|months|years","anchor":"completion|planned"}`
+- `{"kind":"one_time","due_date":"YYYY-MM-DD"}`
+- `{"kind":"manual"}`
+- `{"kind":"weekdays","weekdays":[0..6]}`  (0=Mon … 6=Sun)
+- `{"kind":"nth_weekday","nth":1..5 or -1,"weekday":0..6,"months":[1..12]?}`  (-1 = last)
+- `{"kind":"day_of_month","day":1..31,"months":[1..12]?}`
+- `{"kind":"calendar","entity_id":"calendar.xyz"}` (2.89, #187) — once per event
+  of a HA calendar entity: occurrences = the events' start dates (local day),
+  next due = the first event strictly after the last completion (before any
+  completion: the first on/after creation). No upcoming event → no due date.
+  The natural fit for waste-collection calendars ("put the bins out"). Reads
+  echo `schedule_entity_name` (the calendar's friendly name) for this kind.
+  Every task read also carries `next_event_titles` (2.92, #189): the titles
+  of the calendar events behind `next_due` (`["Residual waste", "Paper"]`;
+  `[]` for other kinds or a postponed date). The task name itself never
+  changes.
+
+Every calendar kind also takes `"offset": ±N` days (clamped ±15), and every
+recurring kind `season_months` / `ends` (see CONFIGURATION.md).
+
+For most setup work, `interval_days` + `interval_unit` is all you need.
+
+---
+
+## Read & settings
+
+### `version`
+→ `{version:"2.95.0", installed_version:"2.96.0", restart_pending:true}` —
+`version` is the integration version Home Assistant runs, `installed_version`
+the one in manifest.json on disk (null when unreadable). They differ after an
+update was installed and Home Assistant has not restarted since:
+`restart_pending` is then true, and the panel asks for a restart (until then,
+actions can fail with `unknown_error`). The panel also uses `version` for the
+stale-bundle handshake; useful for the assistant to report/verify what is
+running.
+
+### `statistics`
+→ `{total_objects, total_tasks, overdue, due_soon, triggered, ok, total_cost,
+budget: {currency, currency_symbol, currency_decimals}, summary_entity_ids:
+{overdue, due_soon, triggered, ok}}`. Use to verify counts before/after.
+
+### `subscribe` — read — live push
+`{deltas?, compact?}` → an immediate empty result, then a stream of `event`
+messages. `compact: true` applies the same empty-key stripping as the
+`objects` read to every snapshot and delta.
+Without `deltas` (legacy default): every event is `{objects:[…]}` in the same
+shape as the `objects` read, pushed on every coordinator update (and when a
+new object entry appears). With `deltas: true` (v2.52): the first event is a
+full `{objects:[…]}` snapshot, after that events are
+`{delta:[…changed object responses…], removed:[entry_ids]}` carrying only
+entries whose rebuilt response actually changed (byte-identical rebuilds are
+suppressed server-side). Updates are coalesced into one trailing send per
+second either way. Unsubscribe with HA's standard `unsubscribe_events` on the
+same message id. Useful to watch a trigger flip during verification; a plain
+`objects` re-read is enough for one-shot checks.
+
+### `schedule/preview` — read — "your next three dates"
+`{schedule (req, nested Schedule dict), last_performed?, times_performed?
+(0..100000, default 0), count? (1..10, default 3)}` →
+`{occurrences:["YYYY-MM-DD", …], series_ended: bool}`. Runs a **draft**
+recurrence through the real scheduling engine (nothing is stored), simulating an
+on-time completion per step — so completion-anchored intervals, calendar kinds,
+season windows and finite series all advance exactly as they will in production.
+Use it to show the user concrete dates before `task/create`. Bad
+`last_performed` → `invalid_date`; an unusable schedule → `invalid_input`.
+
+### `budget_status` — read
+`{}` → `{monthly_budget, monthly_spent, yearly_budget, yearly_spent,
+alert_threshold_pct, currency_symbol}` — spend summed from completion history
+costs in the current month/year against the configured budgets.
+
+### `entity/attributes` — read
+`{entity_id}` → the attributes worth monitoring on that entity (domain mapping
+merged with the live state). Call it before putting `attribute` into a
+`trigger_config` so you offer real keys instead of guessing.
+
+### `tags/list` — read
+`{}` → `{tags:[{id,name}]}` — the HA NFC tag registry, for filling a task's
+`nfc_tag_id`. Names are resolved from the entity registry (tags read back as
+bare UUIDs otherwise after a restart).
+
+### `objects` / `object`
+`objects` `{compact?}` → `{objects:[{entry_id, object:{…}, tasks:[…]}]}`.
+`object` `{entry_id}` → one such record. Task summaries include the computed
+`status,is_done,days_until_due,next_due,trigger_active,trigger_current_value,
+trigger_entity_info` plus both flat and nested schedule views — use these in
+Phase 5 to confirm triggers resolved to real entities. `compact: true`
+(v2.53) strips keys whose value is null/[]/{} from the response/object/task
+levels (−52 % payload); read absent keys as their empty value. Without the
+flag every field is always present — assistants should simply omit it.
+
+### `users/list`
+→ `{users:[{id,name}]}` (admins also get `is_admin`,`is_owner`). Use to map a
+person to `responsible_user_id`.
+
+### `settings` (read) / `global/update` (admin-only write)
+`settings` → full nested settings. `global/update` `{settings:{key:value}}`
+accepts only whitelisted keys (unknown silently ignored); out-of-range/typed
+values dropped. Keys relevant to setup:
+- `notifications_enabled` (bool), `notify_service` (str; validated `notify.*`),
+  `default_warning_days` (0..365; 0 = due soon only on the due date), `panel_enabled` (bool), `panel_title` (str)
+- `default_consumable_threshold` (1..90, default 10; 2.69) — the floor Suggested
+  setups pre-wires for percent-remaining consumables; `battery_low_percent`
+  (1..90, default 20; 2.69) — fleet-wide "battery low" floor for batteries
+  without a Battery Notes threshold (#146); `battery_recovered_percent`
+  (20..100, default 50; 2.87, #180) — a low battery stays low until its level
+  rises above this or a replacement date is recorded; `battery_auto_record_recovery`
+  (bool, default false; 2.88, #181) — when a low battery rises above the
+  recovery threshold, record the replacement in Battery Notes and consume the
+  type part automatically (no note / rechargeable / level-less rows never)
+- `row_action_style` (`buttons_compact` | `buttons` | `icons`; 2.69) — how task
+  rows show Complete/Skip (HA buttons, icon-only on phones; labelled everywhere;
+  classic icons). `row_action_notice_pending` (bool) is the one-time "new look"
+  banner flag the 5→6 migration raises for existing installs; the panel's
+  banner clears it (optionally together with `row_action_style: "icons"`).
+- `shopping_list_entity` (str; a `todo.*` entity id, `""` = off) — 2.67: mirrors
+  the auto buy reminders into that to-do list; check-off completes + restocks
+- `weekly_digest_enabled` (bool) — opt-in Monday summary
+- `notify_event_only` (bool; 2.80, #165) — fire `maintenance_supporter_notification`
+  and send nothing (an automation delivers); `notify_extra_data` (str ≤ 2000;
+  JSON/YAML with Jinja over every event field: kind/status/priority/labels/
+  notes/object_name/area_name/task_name/object_ref/task_ref/task_type/
+  days_until_due/next_due/last_performed/responsible_user_id/sensor_entity_id/
+  trigger_entity_id/url/target/title/message — table in docs/ARCHITECTURE.md
+  "Notification event fields", 2.84 #178) —
+  merged into every notify call's `data`, the user's keys win. The event
+  fires for EVERY send (status, lead_time, bundle, digest, warranty, budget,
+  test) with the same fields plus `target`, `title`, `message`, `data`.
+- `notify_completed` (str; 2.83, #173 follow-up) — `off` | `automatic` | `all`: completion
+  notifications (activity kind, household service only) with the reason from the
+  completion's `source`; the settings response echoes `notifications.completed`
+- `battery_lifetime_months` (2.83): `{type: months}` per-type typical lifetime overrides (canonical Battery Notes types, 1–240); the settings response echoes `general.battery_lifetime_months` and a computed `general.battery_lifetimes` catalog `[{type, months, source: override|table|default, default_months, override_months, learned_models: [{model, model_key, months, samples}], in_fleet}]`. `battery_fleet/overview` rows carry `lifetime_months` / `lifetime_source` (override | learned_device | learned_model | table | default) / `lifetime_samples` / `model_key`.
+- `notify_{due_soon,overdue,triggered}_enabled` (bool) + `_interval_hours` (0..720)
+- `quiet_hours_enabled`, `quiet_hours_start`/`end` ("HH:MM")
+- `budget_monthly`/`budget_yearly` (float), `budget_currency` (EUR,USD,GBP,…),
+  `budget_alerts_enabled`, `budget_alert_threshold` (10..100)
+- `currency_decimals` (int 0..3; 2.84) — decimal places for every displayed
+  amount (default 0 = whole numbers); echoed as `budget.currency_decimals`, and
+  as `currency_decimals` in `budget_status` and in `statistics.budget`
+  (`{currency, currency_symbol, currency_decimals}`, new in 2.84)
+- `parts_cost_mode` (`purchase` | `use`; 2.96, #104) — when spare parts count
+  as spending (see *Parts cost*); echoed as `budget.parts_cost_mode`. Don't
+  switch it for the user — it changes how every later completion is booked.
+- `operator_write_enabled` (bool), `admin_panel_user_ids` (list[str]) — governance
+- `advanced_{adaptive,seasonal,environmental,budget,groups,checklists,schedule_time,completion_actions}_visible`
+  (bool, all default false) — the *Advanced Features* switches: they show the
+  matching sections in the panel. If you create tasks that use checklists,
+  completion actions, adaptive scheduling or `schedule_time`, propose switching
+  the matching one on; `schedule_time` has no effect at all while its switch is off.
+- `install_assist_sentences` (bool; 2.44) — copies the shipped Assist sentences
+  (en, de, fr, es, it, nl) into `config/custom_sentences/` so Home Assistant's
+  classic voice agent understands the maintenance commands; LLM agents need
+  nothing (see *Voice* below)
+- `home_type` (`auto` | `house` | `apartment`) and `home_region` (`auto` or a
+  region code; 2.94) — what `templates` recommends; `disabled_template_ids`
+  (list) hides templates from the pickers
+- `snooze_duration_hours` (1..168), `reminder_lead_days` (≤10 days-before-due
+  values, e.g. `[14, 3, 0]`, one extra reminder each), `max_notifications_per_day` (0..1000),
+  `notification_bundling_enabled` + `notification_bundle_threshold` (2..20),
+  `action_{complete,skip,snooze}_enabled` (the mobile notification buttons,
+  default off), `warranty_reminder_enabled` + `warranty_reminder_days` (1..365)
+- `archive_oneoff_days` / `delete_archived_oneoff_days` (0..3650) — tidy-up of
+  finished one-time tasks
+
+The complete list with defaults (64 keys): docs/CONFIGURATION.md.
+
+Propose settings changes separately and only after the user opts in; they need
+an admin token.
+
+### `global/test_notification` / `notify/user_targets` — admin
+- `global/test_notification` `{user_id?}` → `{success, result, message}`.
+  Without `user_id` the household service is tested. With one, the send is
+  resolved exactly like a real reminder for that person, so a green result
+  actually proves their phone is reachable. `result` is `success`,
+  `no_service`, `invalid_service`, `failed`, or `user_no_device` (that member
+  has no Companion device, so nothing was sent and their reminders fall back
+  to the household service).
+- `notify/user_targets` `{}` → `{targets:[{user_id,name,services}]}` — which
+  notify services each household member resolves to, empty list meaning the
+  fallback applies. Admin-only because the service names carry device names.
+
+### `groups` / `group/create` / `group/update` / `group/delete`
+Groups bundle tasks from **different objects** under one name ("Spring
+service"), for grouped panel lists and grouped notifications.
+- `groups` — read — `{}` → `{groups:{"<group_id>":{name,description,task_refs:[{entry_id,task_id}]}}}`.
+- `group/create` — `@require_write` — `{name (req), description?, task_refs?}` → `{group_id}`.
+- `group/update` — `@require_write` — `{group_id (req), name?, description?, task_refs?}` (partial) → `{"success": true}`.
+- `group/delete` — `@require_write` — `{group_id}` → `{"success": true}`. Unknown id → `not_found`.
+
+### QR codes — `qr/generate` / `qr/batch_generate` — read
+- `qr/generate` `{entry_id (req), task_id?, action? (view|complete|quick_complete,
+  default view), url_mode? (server|local|companion, default server), base_url?}`
+  → `{svg_data_uri, url, label:{object_name,manufacturer,model,task_name}}`.
+  A sticker for an object or one task. No HA URL configured → `no_url`.
+- `qr/batch_generate` `{entry_ids?, task_ids?, actions (req, ≥1 of
+  view|complete|skip|quick_complete), url_mode?, base_url?}` →
+  `{qrs:[{entry_id,task_id,object_name,task_name,action,svg}], total}`. Omitted
+  filters mean "all" at that level. Capped at 200 QRs per call (`too_many`).
+
+## Reference numbers
+
+Objects, tasks and completions carry stable reference numbers (`ref_no`: `8`,
+`8.3`, `8.3-2`; 2.79+) that are never reused after a delete. `search` answers to
+them (archived items included, 2.86+).
+
+### `reference_numbers/compact` — `@require_admin` (#170, 2.88+)
+`{}` → `{objects, tasks, completions}` (counts renumbered). Renumbers every
+object, task and completion sequentially in creation order, closes the gaps
+left by deletions and resets the counters. Explicit and destructive for
+anything printed — the panel asks for a confirm; the assistant must too.
+
+## Backup / migration — export & import
+
+### `export` — admin — JSON/YAML backup
+`{format:"json"|"yaml", include_history:bool, entry_ids?:[...]}` → `{format, data}`
+(serialized string). `entry_ids` (optional) narrows to a selection of object
+entries — a **selective** export to move one asset between installs; omit for
+all. Carries every persisted field incl. parts+stock, consumes_parts, nested
+schedule (season/ends/due_override), archived_at/created_at. Since 2.96 it
+also names what ids cannot carry to another instance: `users` ({user id:
+name}) and `devices` ({device id: the device's integration identifiers /
+connections}). Document file *contents* are NOT here (see the documents
+archive below) — only metadata.
+
+### `csv/export` — admin — flat CSV
+`{entry_ids?:[...]}` → `{csv}`. One row per task, object columns repeated
+(incl. `priority` + `labels` as a "\n"-joined cell since the #134 audit). A
+reduced view: no parts / history / nested-schedule extras (tabular by design
+— the covered-or-excluded contract is pinned by
+`tests/test_export_roundtrip.py`).
+
+### `objects/csv` — one row per object (#67)
+`{entry_ids?:[...]}` → `{csv}`. Asset table download (no cost/history), so not
+admin-gated.
+
+### `json/import` — admin — restore JSON **or YAML**
+`{json_content:str}` (accepts JSON and YAML) → `{imported: [{entry_id, name,
+task_count, warnings?}], total, created, errors?, settings_applied?,
+unmatched_users?}`. New ids are generated; parts/consumes links are remapped.
+People are matched **by name** to the users of this instance (assignments,
+rotations, "completed by" — create those users first; `unmatched_users` lists
+the ones that matched nobody, and their assignments are removed) and devices
+by their integration identifiers (set the integrations up first). A value of
+the wrong type is dropped with a warning instead of aborting the object (2.96). Selective because it restores
+exactly the objects present in the payload. A payload may also (or only)
+carry a `global_settings` section (from `settings/export`) — applied through
+the same validation as `global/update`; the response then adds
+`settings_applied:[keys]`.
+
+### `settings/export` — admin — the global entry's settings
+`{}` → `{format:"json", data:str}`. The objects export deliberately excludes
+the global scope; this second export carries groups, saved views, vacation
+config, notification/budget settings and the feature toggles. Instance-bound
+keys (panel-access user ids, the adopted-task stash, the `shopping_list_entity`
+target) stay out. Re-import via
+`json/import`.
+
+### `csv/import` — admin — restore flat CSV
+`{csv_content:str}` → `{created, ...}`.
+
+### Documents archive (ZIP with file contents) — HTTP, admin
+Not WebSocket — the blobs are binary. `GET /api/maintenance_supporter/documents/archive`
+(optional `?entry_ids=a,b`) streams a ZIP a person can browse too (version 2,
+2.96): `README.txt`, `manifest.json`, one folder per object with its files
+under their category (`Family Car/Manuals/…pdf`), completion photos in their
+task's folder named by the day, web links in `Links.txt`. Version-1 archives
+(`blobs/<sha256>`) still import. Fetch via a signed path (`auth/sign_path`). `POST` the same URL with multipart
+`file=<zip>` restores blobs and re-attaches metadata (matches objects by id,
+then by name for a cross-instance restore; idempotent). This is the one export
+that carries uploaded file *contents* — pair it with a JSON export for a
+complete, portable backup.
+
+## Documents — manuals, invoices, web-links
+
+Everything JSON rides the WebSocket; binary **upload/download** goes through the
+authenticated HTTP views (a websocket frame is a poor fit for a 20 MB PDF). Reads
+are open, mutations are `@require_write` — documents are object content, not
+global config.
+
+### `documents/list` — read
+`{entry_id}` → `{documents:[…]}` — one object's documents, newest first.
+
+### `documents/search` — read
+`{query (req, ≤200)}` → `{results:[{id,entry_id,object_name,kind,title,filename,
+url,size,tags}]}`. Tolerant match over title / filename / url / mime / tags
+across **all** objects, best first, ≤50 hits: every word of the query must
+match somewhere (prefix, substring or one typo; case, diacritics and `ue/oe/
+ae/ss` spellings folded). The fastest way to answer "do we already have the
+manual for X?".
+
+### `search` — read
+`{query (req, ≤200), limit? (1–20, default 8)}` → `{documents:[…], history:[…]}`
+— the server half of the panel's global search (2.78, #171). `documents` are
+the tolerant metadata hits above PLUS **content hits** from the full-text
+index over uploaded files (`match: "meta"|"content"`, `page`, `snippet`,
+`score`; a document matching both keeps the page). The index holds the TEXT
+LAYER of PDFs (born-digital or already OCR'd) and `text/*` files — there is
+no OCR, photos and scan-only PDFs are invisible to it. `history` are task
+history entries whose `notes` match: `{entry_id, task_id, task_name,
+object_name, timestamp, type, ref, snippet, score}` (`ref` = the completion's
+reference `8.3-2`, null when unnumbered). A query that IS a reference with a
+completion part (`8.3-2`) returns exactly that entry (score 1000) and no
+documents. Both lists best first, `limit` each. Objects, tasks and parts are
+NOT here — the panel matches those from data it already holds (a typed `8` or
+`8.3` too).
+
+### `documents/storage` — read
+`{}` → the global storage summary (physical vs logical bytes, per object and
+category). Blobs are refcounted — the same file on two objects costs bytes once.
+`search_index` (2.78) says how much of the library the full-text search can
+see: `{total, indexed, no_text, unsupported, pending}` — `no_text` are PDFs
+without a text layer (scans), `unsupported` photos and other binaries,
+`pending` files the delayed backfill has not reached yet.
+
+### `documents/add_link` — `@require_write`
+`{entry_id (req), url (req, absolute http/https), title?, tags? (≤20 × ≤64), description? (≤2000, 2.84)}` →
+the created document. Costs 0 storage and is not carried in backups (it's a
+reference, not a file). A relative or non-http(s) URL → `invalid_url`; a link counts
+toward the 100 documents per object (`limit_reached`, 2.104). This is
+the right home for a manufacturer manual you found in Phase 3.
+
+### `documents/update` — `@require_write`
+`{doc_id (req), title?, tags?, description? (≤2000, 2.84 — '' clears), task_ids? (≤100),
+task_pages? {task_id: page}, part_ids? (≤100)}` → the updated document. Only present keys change; a present
+but empty `title` clears it. `task_pages` makes "open the manual at the right
+page" work per task (PDF `#page=N`). Unknown id → `not_found`.
+
+### `documents/delete` — `@require_write`
+`{doc_id}` → `{"success": true, "bytes_freed": N}`. Bytes come back only when
+the **last** reference to a blob goes.
+
+### `documents/discard_upload` — read
+`{entry_id (req), doc_id (req)}` → `{"success": true}`. Deletes a completion
+photo that never became part of a record — the counterpart of the photo
+upload every signed-in user may make. Only a document of that object, tagged
+exactly `photo`, that no history entry (of any task), spare part or task link
+points at; anything else answers `not_found` (whether it exists or not).
+Unattached photos older than 24 h are also removed by the daily retention
+sweep, and a non-writer can have at most 20 of them per object waiting.
+
+## Suggested setups — the shipped signature catalog
+
+**Use this before hand-rolling discovery.** The integration ships a catalog of
+**263 integrations / 552 verified signatures** (`helpers/signatures/`, every
+entry read against the integration's own source) that maps consumable and wear
+entities onto maintenance duties. Discovery runs **server-side**: it walks the
+entity registry, applies the model/sibling/unit gates, hides duties already
+watched by an existing task, and hands back devices with their triggers already
+chosen. You get better wiring than any state heuristic can infer, and adoption
+never trusts client-supplied thresholds.
+
+### `integration_setups/discover` — read
+`{}` → `{setups:[{device_id, device_name, area_name, integration,
+integration_name, suggested_entry_id, suggested_object_name,
+tasks:[{task_name, catalog_task_name, entity_label, task_name_localized,
+entity_ids, threshold, direction}]}]}`.
+
+`suggested_entry_id` is the maintenance object already bound to that device
+(adopt extends it instead of creating a duplicate); it is `null` when the device
+is new to us, and `suggested_object_name` then falls back to the device name.
+
+2.94 adds, per device: `candidate` — `{entry_id, name, reasons}` for an
+UNBOUND device, the existing object it most likely is (`reasons` ⊆ `model`,
+`name`, `area`, `sibling`; `null` when none or two equally good ones);
+`target_entry_id` / `target_task_count` — the object the proposals were judged
+against (bound, else candidate, else `null` = new object); `already` —
+`[{task_name, task_name_localized, existing_name}]`, duties the target has by
+name (never proposed); and per task `covered_by` — `{task_id, name, reason}`
+(`similar_name` / `same_action` / `same_quantity`) when the target probably
+has it under another name. Adopt into the candidate with its `entry_id` and
+the wanted `task_names` — it links the device to that object.
+`direction` says which shape the duty is (`percent_left`, `duration_left`,
+`usage_above`, `usage_delta`, `runtime_hours`, `event_present`, `alert_above`,
+`value_below`, `cycle_count`) and `threshold` is the adoption-time default in the
+entity's own display unit. `task_name` is the **English catalog key** — adopt
+selections match on it; `task_name_localized` is what you show the user.
+Per-entity duties (colour printer cartridges) come back as one task per
+entity: `task_name` then carries a ` — <entity label>` suffix and is still the
+selection key, `catalog_task_name` is the bare catalog key and `entity_label`
+the suffix (`null` for ordinary duties).
+Per task `reset` (2.95) — `{entity_id, name, disabled}` or `null`: the
+integration's own reset button for that counter on the same device; adopting
+makes it the task's completion action (`button.press`, not run when the task
+completes itself), and enables it when the integration shipped it disabled.
+
+### `integration_setups/preview` — read (2.94)
+`{device_id, entry_id?: id|null}` → the same device object as in `discover`,
+judged against `entry_id` (`null`/omitted = a new object): `covered_by`,
+`already` and `target_task_count` follow the chosen target. `not_found` when
+`entry_id` is no maintenance object or the device has no suggestion.
+
+### `integration_setups/adopt` — `@require_write`
+`{selections:[{device_id (req), entry_id?, object_name?, task_names?,
+baselines? {task_name: number}}]}` (1..50 selections) →
+`{tasks_created, objects_created, total, errors?}`.
+
+Discovery is re-run server-side on adopt, so the entities and thresholds always
+come from the catalog. Omit `task_names` to adopt every suggested duty. Without
+`entry_id` the suggested/new object is created and bound to the device (an
+existing object picked by `entry_id` gets bound too, so future discovery
+recognises it). `baselines` is the "#102 last service was at reading X" input —
+only meaningful for `usage_delta` duties, where the delta then counts from X, so
+an already-elapsed interval comes due immediately.
+
+### `integration_setups/reset_offers` — read (2.95)
+`{}` → `{offers:[{entry_id, object_name, task_id, task_name, integration_name,
+button_entity_id, button_name, button_disabled, renamed}]}` — existing tasks
+that are a catalog duty (by their `origin` fingerprint or their name, any
+language) whose watched counter the integration can reset, with no completion
+action yet. `renamed: true` — no fingerprint and another name, but exactly the
+catalog's trigger shape: offer it unticked and let the user confirm. Wiring
+records the task's `origin`.
+
+### `integration_setups/wire_resets` — `@require_write` (2.95)
+`{items:[{entry_id, task_id}]}` (1..200) → `{wired}`. Recomputes the offers
+server-side and wires only those: the reset button becomes the task's
+completion action, run as the calling user.
+
+## Problem sensors — adopt HA `device_class: problem` binary sensors
+
+### `problem_sensors/discover` — read
+`{}` → `{sensors:[{entity_id,name,state,device_id,device_name,area_name,
+suggested_entry_id,suggested_object_name,suggested_part_id,suggested_part_name}]}`.
+Lists adoptable problem sensors NOT already watched by a task (`state:"on"` =
+problem active now). When the suggested existing object owns a spare part whose
+name matches the sensor's (toner-low ↔ "Toner cartridge"), `suggested_part_*`
+carry it so adoption can pre-link it. 2.94 adds `candidate` (`{entry_id, name,
+reasons}` — the existing object an unbound device most likely is),
+`target_entry_id` (bound, else candidate, else `null`) and `covered_by`
+(`{task_id, name, reason}` — the target probably watches this already under
+another name). Adopting with the candidate's `entry_id` and the sensor's
+`device_id` links that object to the device.
+
+### `problem_sensors/preview` — read (2.94)
+`{selections:[{entity_id, name, entry_id?}]}` (≤100) → `{covered:{entity_id:
+{task_id,name,reason}|null}}` — each sensor judged against the object it would
+now go to (`null` entry = a new object, nothing to cover).
+
+### `problem_sensors/adopt` — @require_write
+`{selections:[{entity_id,name,entry_id?,object_name?,device_id?,part_id?,for_minutes?}]}` →
+(2.90: selections in one batch that share an `object_name` — case-insensitive — share ONE new
+object even across HA devices; pass `entry_id` to join an existing object) `{tasks_created,objects_created,total,errors?}`. Each selection becomes a task
+that triggers while the sensor is on and auto-completes on recovery
+(`state_change` → `on` + `auto_complete_on_recovery`). `for_minutes` (#136,
+0–1440) writes `trigger_for_minutes` on the created trigger: the problem must
+persist that long before the task fires — the flicker filter for sensors that
+report problems for a few seconds. Omitted/0 = trigger on the first flicker.
+With `entry_id` it
+attaches to that object; otherwise a fresh object (`object_name`, bound to
+`device_id`) is created — two selections sharing a `device_id` reuse one object.
+A `part_id` (from discovery's suggestion) links the part as the task's
+`consumes_parts` (qty 1) — completing the task then consumes/restocks it;
+unknown ids are silently dropped.
+
+## Battery Fleet — one task for every battery in the house
+
+Instead of one threshold task per battery, the integration aggregates all
+**Battery Notes** devices into a SINGLE maintenance task plus a per-type
+shopping list (AA, AAA, CR2032 …). Do not propose per-battery threshold tasks —
+offer the fleet.
+
+### `battery_fleet/status` — read
+`{}` → `{available, configured}` — the cheap check behind the panel's
+one-click-setup button (any trackable battery present / fleet object
+exists). Unlike `overview` it reads NO battery data and never touches the
+trend machinery — use it whenever those two booleans are all you need.
+
+### `battery_fleet/overview` — read
+`{}` → `{available` (any batteries at all)`, has_battery_notes, configured`
+(the fleet object exists)`, task_ok` (its task + trigger are intact)`, entry_id,
+total, low, soon, all, needs_now:{type:count}, needs_soon:{…}, types,
+excluded:[{entity_id,device_name}], track_self_charging, due_without_sensor}`.
+`all` is the full roster (#113): every
+tracked battery as `{entity_id, device_name, battery_type, quantity, level,
+days_until, forecast_days, available, predicted_source, prediction_confidence,
+rechargeable, low_threshold, forecast_overdue, no_sensor, last_replaced, status}`
+with status `low|soon|ok`. `days_until` of a `soon` row never goes below 0: a
+forecast that has passed on a battery still reporting healthy is clamped to 0
+with `forecast_overdue` true (it sorts first and never escalates to `low`).
+`forecast_days` is the same forecast unclamped, negative once it has
+passed, and null where the row shows no forecast; the panel draws the ~date
+from it. `no_sensor` (2.75+, D#162) marks a Battery Notes note whose
+device has NO battery level at all — the row is read from the note's
+`…_battery_type` sensor (`entity_id` is that sensor), `level` is null, it is
+never offline, and `last_replaced` (ISO date or null) is the forecast's
+anchor. With `due_without_sensor` on (default) such a row turns `low` once
+its forecast has passed (negative `days_until`, `forecast_overdue` true) —
+the only way a sensorless battery can ever reach the fleet task; batteries
+WITH a sensor never escalate on a forecast alone. `low_threshold` (2.51+) is
+the battery's own low level — Battery Notes' configured threshold or the
+fleet-wide 20 % floor, whichever is higher. `predicted_source` (2.50+) is `"trend"`
+when `days_until` comes from the discharge-trend regression (then
+`prediction_confidence` is `medium|high`) or `"typical"` for the
+last-replaced + type-lifetime table. `rechargeable` (2.51+) marks types that
+are charged rather than bought (Rechargeable, Li-ion, packs): the row stays
+for low tracking but never counts into `needs_now`/`needs_soon` and only a
+trend can date it.
+
+### `battery_fleet/overview_history` — read
+`{}` → `{series: {entity_id: {points: [[epoch_s, level]…], threshold,
+jump?}}}` — per-battery 30-day downsampled level history (≤60 points) plus
+the low threshold the trend forecast regresses toward. Backs the roster
+sparklines (2.51+); fetched lazily when the roster is expanded, recorder work
+6 h-cached per entity. Batteries without a level series (low-only binaries)
+are absent. `jump` (`{at, from, to, device_id}`) marks an upward step ≥25
+points that looks like a swap nobody recorded (absent when
+`battery_last_replaced` is within ±2 days of the step, and always for
+rechargeable types — they jump on every charge); the panel's one-click fix
+calls `battery_notes.set_battery_replaced` on `device_id` with the detected
+time.
+
+### `battery_fleet/setup` — `@require_write`
+`{language?}` → creates (or idempotently reconciles) the fleet object, its
+per-type parts and the one task, with names localized to `language`. Also the
+one-click repair when `task_ok` is false. No batteries found → `not_available`.
+
+### `battery_fleet/mark_replaced` — `@require_write`
+`{entity_ids?}` → marks those batteries replaced (presses their Battery Notes
+button and consumes the matching type-parts). Omit `entity_ids` to mark
+everything currently low. Accepts the roster's `entity_id`s — `battery_plus`
+sensors, low binaries or (2.75+) a sensorless note's `…_battery_type`
+sensor; the button is found by Battery Notes' naming contract or, for
+renamed entities, through the registry. `cells` (2.104+, D#213, with
+`set_ask_cells` on): `{entity_id: cell type}` — which cells went in, one of
+the row's `cell_choices` in `battery_fleet/overview`. The new cells leave
+their own part's stock; the ones taken out go on their part's *to charge*
+pile when they were rechargeable. A battery without a choice (or with one it
+cannot take) keeps the cells it holds. Another choice for a battery already
+marked today corrects the first one: the cells booked go back to their
+stock, the chosen ones leave theirs.
+
+### `battery_fleet/set_excluded` — `@require_write`
+`{entity_id (req), excluded (req, bool)}` → `{"success": true}`. Keeps a
+self-charging or retired device out of the fleet (and puts it back). Fleet not
+set up → `not_configured`. Excluding a manually-added battery lifts the
+include instead of stacking an exclusion.
+
+### `battery_fleet/set_included` — `@require_write` (#135)
+`{entity_id (req), included (req, bool)}` → `{"success": true}`. Manually ADD
+a sensor/binary_sensor the discovery heuristics miss: the include bypasses
+the name/%-heuristic and the self-charging filter, while Battery-Notes
+coverage dedupe and the exclusion list still apply. Adding lifts a previous
+exclusion. Fleet not set up → `not_configured`. The include acts DEVICE-wide:
+picking any of a device's battery entities lifts the self-charging filter for
+the whole device, and the richest source (a Battery Notes note) wins the
+roster row. The fleet task's low sensor
+also exposes `batteries_due` / `batteries_due_soon` attributes — one
+dashboard-ready line per device ("<name> — replace (CR2)" / "<name> —
+recharge", capped at 30) — plus `batteries_due_detailed` (2.71+): structured
+rows `{name, type, quantity, level, rechargeable}`, same 30-row cap.
+
+### `battery_fleet/set_track_self_charging` — `@require_write` (#135)
+`{enabled (req, bool)}` → `{"success": true}`. Fleet-wide opt-in that keeps
+self-charging devices (phones, vacuums, smart rings — the #107 filter) in the
+roster as rechargeables: typed "Rechargeable", labelled "— recharge", never
+counted into the shopping needs. Default off (#107 behaviour). Exclusions
+still win. The current state is returned as `track_self_charging` in
+`battery_fleet/overview`. Fleet not set up → `not_configured`.
+
+### `battery_fleet/set_due_without_sensor` — `@require_write` (D#162, 2.75+)
+`{enabled (req, bool)}` → `{"success": true}`. Fleet-wide option, default
+ON: a Battery Notes note without a level sensor (only type, quantity and
+last-replaced exist — Xiaomi/Aqara-style sensors) counts as due once its
+predicted replacement date has passed, so the Low Batteries task fires for
+it. Nothing else ever could: there is no reading to say "still fine". Off →
+such notes only forecast (soon, never low). Batteries WITH a sensor are
+unaffected either way. The current state is returned as
+`due_without_sensor` in `battery_fleet/overview`. Fleet not set up →
+`not_configured`.
+
+### `battery_fleet/set_ask_cells` — `@require_write` (D#213, 2.104+)
+`{enabled (req, bool)}` → `{"success": true}`. Fleet-wide opt-in, default
+OFF: *Replaced* asks which cells went in — the type Battery Notes names or
+any fleet part of the same size, disposable or rechargeable — books those
+and remembers them per battery (a backup carries them). Battery Notes keeps
+its type; the shopping needs and the forecast follow it. With the option
+on, `battery_fleet/overview` returns `ask_cells: true` and, on every row
+(`low`, `soon`, `all`) with two choices or more, `cell_choices: [{type, name, rechargeable}]`
+and `cells_installed`. Fleet not set up → `not_configured`.
+
+### `battery_fleet/record_replacement` — `@require_write` (#181, 2.87+)
+`{entity_id (req), replaced_at (req, ISO datetime)}` → `{recorded, already_recorded,
+consumed: {part_id: qty}}`. Records a detected-but-unrecorded swap (the roster's
+calendar chip) as the Battery Notes replacement date AND consumes the type
+part by the note's `battery_quantity`, once per day per battery — the same
+effect as `mark_replaced`. Native (non-Battery-Notes) rows and rechargeables
+are skipped (`recorded: false`). The fleet task itself carries no part links;
+a `consumes_parts` link left on it is ignored on fleet completions (2.88).
+Errors: `not_found`, `not_configured`.
+
+## Voice — Assist intents (not WebSocket)
+
+Nothing to call here, but worth telling the user at hand-off: the integration
+registers 15 Assist intents (what is due — overall, overdue, this week, in a
+room, mine, here —, complete, skip, postpone, snooze, instructions, due date,
+part stock, record a reading, add a note, whose turn, what to buy, bought
+parts, low batteries, undo the last voice action). LLM-based Assist pipelines
+get them as tools automatically, in any language. Home Assistant's classic
+agent needs the `install_assist_sentences` setting (admin) and understands
+English, German, French, Spanish, Italian and Dutch. Names matter here: a task
+is found by what people SAY, so "Water filter" on "Kitchen sink" beats
+"WF-2000 cartridge swap" — suggest spoken-friendly task names.
+
+## Saved filter views — shared named panel-list filter combinations
+
+Views bundle the task-list filters (`status`, `user_id`, `label`, `archived`)
+plus `sort_mode` + `group_by` under a name. One shared list on the global entry;
+everything is re-sanitised on read/save (unknown values coerce to the permissive
+default). Note the field is `view_id`, not `id` — `id` is the WS message id.
+
+Views are not display-only: the global setting `notify_scope_view_id` scopes
+**notifications** to one view, and that routing honours the task-selecting
+filters (`label`, `user_id`) while ignoring the display ones (status, archived,
+sort/group). So "only notify about the garden tasks" is a view + that setting.
+
+### `views/list` — read
+`{}` → `{views:[{id,name,filters:{status,user_id,label,priority,archived,sort_mode,group_by}}]}`.
+`priority` (#134): `""` | `low` | `normal` | `high` — a task-selecting dimension
+(also honoured by the notification view-scope and the card's `view_id`).
+
+### `views/save` — @require_write
+`{name, view_id?, filters?}` → `{views:[...], saved_id}`. Omit `view_id` to
+create; include it to update in place. Rejects past 50 views (`too_many_views`).
+
+### `views/delete` — @require_write
+`{view_id}` → `{views:[...]}`. No-op if the id doesn't exist.
+
+## Vacation mode — pause reminders for a date window
+
+One global window with a buffer and an exemption list; exempt tasks keep
+notifying (the cat's medication doesn't care that you're away).
+
+### `vacation/state` — read
+`{}` → `{enabled, start, end, buffer_days, exempt_task_ids, is_active, window_end}`.
+
+### `vacation/preview` — read
+`{}` → `{rows:[…], window_end}` — the projected impact of the **currently
+stored** dates, even while the toggle is off (that's the "Preview impact"
+button). No start/end stored → `{rows: [], window_end: null}`, so patch the
+dates via `vacation/update` first if you want a live preview.
+
+### `vacation/update` — **admin**
+`{enabled?, start?, end? (YYYY-MM-DD | null), buffer_days? (0..14),
+exempt_task_ids? (≤2000)}` (partial) → the new state. Errors: `invalid_date`,
+`invalid_range` (end before start).
+
+### `vacation/end_now` — **admin**
+`{}` → the new state. Switches vacation off immediately and clamps the end date
+to today, keeping the dates for reuse.
